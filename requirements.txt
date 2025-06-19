@@ -33,8 +33,9 @@ starlette==0.38.6
 stringzilla==3.12.5
 sympy==1.14.0
 tifffile==2025.6.11
-torch==2.4.1
-torchvision==0.19.1
+torch==2.7.1+cu128
+torchaudio==2.7.1+cu128
+torchvision==0.22.1+cu128
 typing-inspection==0.4.1
 typing_extensions==4.14.0
 uvicorn==0.30.6
