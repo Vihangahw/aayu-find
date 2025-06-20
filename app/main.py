@@ -38,7 +38,9 @@ CONFIG = {
         transforms.Resize((256, 256)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    ]),
+    'min_mask_sum': 1000,  # minimum mask sum to accept segmentation
+    'min_contour_area': 5000  # minimum contour area for leaf detection
 }
 
 # create photo_dir
@@ -83,6 +85,22 @@ except Exception as e:
     logger.error(f"Failed to load CNN: {str(e)}")
     raise RuntimeError(f"CNN loading failed: {str(e)}")
 
+def is_blank_image(image):
+    """Check if image is blank (low variance or near-uniform pixel values)."""
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    variance = np.var(gray)
+    logger.info(f"Image variance: {variance}")
+    return variance < 10  # threshold for blank image
+
+def detect_leaf(mask):
+    """Detect if the mask contains a valid leaf shape using contour area."""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return False, 0
+    max_contour_area = max([cv2.contourArea(c) for c in contours], default=0)
+    logger.info(f"Max contour area: {max_contour_area}")
+    return max_contour_area >= CONFIG['min_contour_area'], max_contour_area
+
 def blur_background(image, mask, kernel_size=(15, 15)):
     blurred = cv2.GaussianBlur(image, kernel_size, sigmaX=10)
     result = np.where(mask[..., np.newaxis], image, blurred)
@@ -93,8 +111,8 @@ async def health_check():
     logger.info("Health check accessed")
     return {'status': 'OK'}
 
-@app.post('/predict')
-@app.post('/api/predict')
+@app.post('/predict', response_model=PredictionResponse)
+@app.post('/api/predict', response_model=PredictionResponse)
 async def predict(file: UploadFile = File(...)):
     try:
         # read image
@@ -105,6 +123,11 @@ async def predict(file: UploadFile = File(...)):
         filename = file.filename
         logger.info(f"Predict endpoint accessed for file: {filename}")
 
+        # check for blank image
+        if is_blank_image(img):
+            logger.warning(f"Blank image detected: {filename}")
+            raise HTTPException(status_code=400, detail="Blank or invalid image provided")
+
         # segment
         img_tensor = CONFIG['segment_transform'](img).unsqueeze(0).to(CONFIG['device'])
         with torch.no_grad():
@@ -113,12 +136,18 @@ async def predict(file: UploadFile = File(...)):
             mask_sum = mask_pred.sum()
             logger.info(f"Mask sum for {filename}: {mask_sum}")
 
+        # check for valid leaf segmentation
+        if mask_sum < CONFIG['min_mask_sum']:
+            logger.warning(f"No leaf detected: low mask sum ({mask_sum}) for {filename}")
+            raise HTTPException(status_code=400, detail="No leaf detected: insufficient segmentation")
+
+        is_leaf, contour_area = detect_leaf(mask_pred)
+        if not is_leaf:
+            logger.warning(f"No leaf detected: invalid shape (contour area: {contour_area}) for {filename}")
+            raise HTTPException(status_code=400, detail="No leaf detected: invalid shape")
+
         # blur background
-        if mask_sum == 0:
-            logger.warning(f"Empty mask for {filename}, using original image")
-            img_blurred = img
-        else:
-            img_blurred = blur_background(img, mask_pred)
+        img_blurred = blur_background(img, mask_pred)
         segmented_img = Image.fromarray(img_blurred)
 
         # save to photos
@@ -164,6 +193,8 @@ async def predict(file: UploadFile = File(...)):
             final_class=CONFIG['classes'][pred_class],
             final_confidence=confidence
         )
+    except HTTPException as e:
+        raise e
     except Exception as e:
         logger.error(f"Error processing {filename}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
