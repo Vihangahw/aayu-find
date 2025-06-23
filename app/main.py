@@ -1,22 +1,25 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from app.models import my_unet, resnet_model, effnet_model, leaf_cnn
+from app.models import my_unet
 from app.schemas import PredictionResponse
 from PIL import Image
 import torch
+import torch.nn as nn
+import torchvision.models as models
 import torchvision.transforms as transforms
 import io
 import os
 import logging
-from collections import Counter
 import cv2
 import numpy as np
+import json
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="AAYU-FIND Leaf ID")
 
-# config
+# Configuration
 CONFIG = {
     'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
     'image_size': (256, 256),
@@ -24,29 +27,30 @@ CONFIG = {
     'classes': ['HeenBovitiya', 'Karapincha', 'Kowakka', 'YakiNaran'],
     'model_paths': {
         'unet': 'models/unet/unet_best.pth',
-        'resnet': 'models/resnet/best_resnet.pth',
-        'effnet': 'models/efficientnet/best_efficientnet.pth',
-        'cnn': 'models/cnn/classifier_model2_best.pth'
+        'ensemble': 'models/ensemble/ensembleUNET_model_best.pth'
     },
     'photo_dir': 'dataset/photos',
+    'predictions_dir': 'predictions',
     'segment_transform': transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((256, 256)),
-        transforms.ToTensor()  # normalizes to [0,1]
+        transforms.ToTensor()
     ]),
     'classify_transform': transforms.Compose([
         transforms.Resize((256, 256)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ]),
-    'min_mask_sum': 1000,  # minimum mask sum to accept segmentation
-    'min_contour_area': 5000  # minimum contour area for leaf detection
+    'min_mask_sum': 1000,
+    'min_contour_area': 4000,
+    'min_confidence': 0.7
 }
 
-# create photo_dir
+# Create directories
 os.makedirs(CONFIG['photo_dir'], exist_ok=True)
+os.makedirs(CONFIG['predictions_dir'], exist_ok=True)
 
-# load models
+# Load models
 try:
     unet = my_unet().to(CONFIG['device'])
     unet.load_state_dict(torch.load(CONFIG['model_paths']['unet'], map_location=CONFIG['device'], weights_only=True))
@@ -57,43 +61,80 @@ except Exception as e:
     raise RuntimeError(f"U-Net loading failed: {str(e)}")
 
 try:
-    resnet = resnet_model(num_classes=CONFIG['num_classes']).to(CONFIG['device'])
-    resnet_state_dict = torch.load(CONFIG['model_paths']['resnet'], map_location=CONFIG['device'], weights_only=True)
-    resnet.load_state_dict({f'resnet.{k}': v for k, v in resnet_state_dict.items()})
-    resnet.eval()
-    logger.info("ResNet loaded successfully")
-except Exception as e:
-    logger.error(f"Failed to load ResNet: {str(e)}")
-    raise RuntimeError(f"ResNet loading failed: {str(e)}")
+    def create_resnet(num_classes):
+        model = models.resnet18(weights=None)
+        num_ftrs = model.fc.in_features
+        model.fc = nn.Linear(num_ftrs, num_classes)
+        return model
 
-try:
-    effnet = effnet_model(num_classes=CONFIG['num_classes']).to(CONFIG['device'])
-    effnet_state_dict = torch.load(CONFIG['model_paths']['effnet'], map_location=CONFIG['device'], weights_only=True)
-    effnet.load_state_dict({k.replace('model.', 'effnet.'): v for k, v in effnet_state_dict.items() if 'num_batches_tracked' not in k})
-    effnet.eval()
-    logger.info("EfficientNet loaded successfully")
-except Exception as e:
-    logger.error(f"Failed to load EfficientNet: {str(e)}")
-    raise RuntimeError(f"EfficientNet loading failed: {str(e)}")
+    def create_efficientnet(num_classes):
+        model = models.efficientnet_b0(weights=None)
+        num_ftrs = model.classifier[1].in_features
+        model.classifier = nn.Linear(num_ftrs, num_classes)
+        return model
 
-try:
-    cnn = leaf_cnn(num_classes=CONFIG['num_classes']).to(CONFIG['device'])
-    cnn.load_state_dict(torch.load(CONFIG['model_paths']['cnn'], map_location=CONFIG['device'], weights_only=True))
-    cnn.eval()
-    logger.info("CNN loaded successfully")
+    def create_custom_cnn(num_classes):
+        return nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            nn.Flatten(),
+            nn.Linear(256 * 16 * 16, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes)
+        )
+
+    class EnsembleModel(nn.Module):
+        def __init__(self, num_classes):
+            super(EnsembleModel, self).__init__()
+            self.models = nn.ModuleList([
+                create_resnet(num_classes),
+                create_custom_cnn(num_classes),
+                create_efficientnet(num_classes)
+            ])
+            for model in self.models:
+                for param in model.parameters():
+                    param.requires_grad = False
+            self.fc = nn.Linear(num_classes, num_classes)
+
+        def forward(self, x):
+            outputs = torch.stack([model(x) for model in self.models], dim=0)
+            avg_output = torch.mean(outputs, dim=0)
+            return self.fc(avg_output)
+
+    ensemble = EnsembleModel(CONFIG['num_classes']).to(CONFIG['device'])
+    ensemble_state_dict = torch.load(CONFIG['model_paths']['ensemble'], map_location=CONFIG['device'], weights_only=True)
+    ensemble.load_state_dict(ensemble_state_dict)
+    ensemble.eval()
+    logger.info("Ensemble model loaded successfully")
 except Exception as e:
-    logger.error(f"Failed to load CNN: {str(e)}")
-    raise RuntimeError(f"CNN loading failed: {str(e)}")
+    logger.error(f"Failed to load Ensemble model: {str(e)}")
+    raise RuntimeError(f"Ensemble model loading failed: {str(e)}")
 
 def is_blank_image(image):
-    """Check if image is blank (low variance or near-uniform pixel values)."""
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     variance = np.var(gray)
     logger.info(f"Image variance: {variance}")
-    return variance < 10  # threshold for blank image
+    return variance < 10
 
 def detect_leaf(mask):
-    """Detect if the mask contains a valid leaf shape using contour area."""
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return False, 0
@@ -106,6 +147,29 @@ def blur_background(image, mask, kernel_size=(15, 15)):
     result = np.where(mask[..., np.newaxis], image, blurred)
     return result
 
+def save_prediction_to_json(data, filename, status):
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    file_path = os.path.join(CONFIG['predictions_dir'], f"{date_str}.json")
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    entry = {"timestamp": timestamp, "filename": filename, "status": status, **data}
+    
+    if not os.path.exists(file_path):
+        with open(file_path, 'w') as f:
+            json.dump([], f)
+        logger.info(f"Created new prediction file: {file_path}")
+    
+    with open(file_path, 'r') as f:
+        try:
+            data_list = json.load(f)
+        except json.JSONDecodeError:
+            data_list = []
+    
+    data_list.append(entry)
+    
+    with open(file_path, 'w') as f:
+        json.dump(data_list, f, indent=4)
+    logger.info(f"{status} logged to {file_path}")
+
 @app.get('/health')
 async def health_check():
     logger.info("Health check accessed")
@@ -115,20 +179,24 @@ async def health_check():
 @app.post('/api/predict', response_model=PredictionResponse)
 async def predict(file: UploadFile = File(...)):
     try:
-        # read image
+        # Read image
         img = cv2.imdecode(np.frombuffer(await file.read(), np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             raise ValueError(f"Failed to load image: {file.filename}")
+        
+        # Resize image to 256x256
+        img = cv2.resize(img, CONFIG['image_size'], interpolation=cv2.INTER_AREA)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         filename = file.filename
         logger.info(f"Predict endpoint accessed for file: {filename}")
 
-        # check for blank image
+        # Check for blank image
         if is_blank_image(img):
             logger.warning(f"Blank image detected: {filename}")
+            save_prediction_to_json({"detail": "Blank or invalid image provided"}, filename, "error")
             raise HTTPException(status_code=400, detail="Blank or invalid image provided")
 
-        # segment
+        # Segment
         img_tensor = CONFIG['segment_transform'](img).unsqueeze(0).to(CONFIG['device'])
         with torch.no_grad():
             mask = unet(img_tensor)
@@ -136,63 +204,51 @@ async def predict(file: UploadFile = File(...)):
             mask_sum = mask_pred.sum()
             logger.info(f"Mask sum for {filename}: {mask_sum}")
 
-        # check for valid leaf segmentation
+        # Check for valid leaf segmentation
         if mask_sum < CONFIG['min_mask_sum']:
             logger.warning(f"No leaf detected: low mask sum ({mask_sum}) for {filename}")
+            save_prediction_to_json({"detail": "No leaf detected: insufficient segmentation"}, filename, "error")
             raise HTTPException(status_code=400, detail="No leaf detected: insufficient segmentation")
 
         is_leaf, contour_area = detect_leaf(mask_pred)
         if not is_leaf:
             logger.warning(f"No leaf detected: invalid shape (contour area: {contour_area}) for {filename}")
+            save_prediction_to_json({"detail": "No leaf detected: invalid shape"}, filename, "error")
             raise HTTPException(status_code=400, detail="No leaf detected: invalid shape")
 
-        # blur background
+        # Blur background
         img_blurred = blur_background(img, mask_pred)
         segmented_img = Image.fromarray(img_blurred)
 
-        # save to photos
+        # Save to photos
         save_path = os.path.join(CONFIG['photo_dir'], f"seg_{filename}")
         segmented_img.save(save_path)
         logger.info(f"Saved segmented image: {save_path}")
 
-        # classify
+        # Classify
         segmented_tensor = CONFIG['classify_transform'](segmented_img).unsqueeze(0).to(CONFIG['device'])
         with torch.no_grad():
-            resnet_pred = resnet(segmented_tensor).softmax(dim=1)
-            effnet_pred = effnet(segmented_tensor).softmax(dim=1)
-            cnn_pred = cnn(segmented_tensor).softmax(dim=1)
-            logger.info(f"ResNet pred: {resnet_pred.tolist()}")
-            logger.info(f"EffNet pred: {effnet_pred.tolist()}")
-            logger.info(f"CNN pred: {cnn_pred.tolist()}")
+            ensemble_pred = ensemble(segmented_tensor).softmax(dim=1)
+            logger.info(f"Ensemble pred: {ensemble_pred.tolist()}")
+            pred_class_idx = ensemble_pred.argmax(dim=1).item()
+            confidence = ensemble_pred[0, pred_class_idx].item()
 
-            # 2/3 voting
-            resnet_class = resnet_pred.argmax(dim=1).item()
-            effnet_class = effnet_pred.argmax(dim=1).item()
-            cnn_class = cnn_pred.argmax(dim=1).item()
-            votes = [resnet_class, effnet_class, cnn_class]
-            vote_counts = Counter(votes)
-            logger.info(f"Votes: {votes}, Counts: {vote_counts}")
+        # Determine final class based on confidence threshold
+        final_class = "CouldNotPredict" if confidence < CONFIG['min_confidence'] else CONFIG['classes'][pred_class_idx]
 
-            if vote_counts.most_common(1)[0][1] >= 2:  # majority
-                pred_class = vote_counts.most_common(1)[0][0]
-                confidences = [resnet_pred[0, pred_class].item(), effnet_pred[0, pred_class].item(), cnn_pred[0, pred_class].item()]
-                confidence = sum(confidences) / len(confidences)
-            else:  # no majority, pick highest confidence
-                preds = [resnet_pred, effnet_pred, cnn_pred]
-                confidences = [p.max().item() for p in preds]
-                pred_class = preds[confidences.index(max(confidences))].argmax(dim=1).item()
-                confidence = max(confidences)
-
-        return PredictionResponse(
-            resnet_class=CONFIG['classes'][resnet_class],
-            resnet_confidence=resnet_pred[0, resnet_class].item(),
-            effnet_class=CONFIG['classes'][effnet_class],
-            effnet_confidence=effnet_pred[0, effnet_class].item(),
-            cnn_class=CONFIG['classes'][cnn_class],
-            cnn_confidence=cnn_pred[0, cnn_class].item(),
-            final_class=CONFIG['classes'][pred_class],
-            final_confidence=confidence
+        # Create prediction response
+        prediction = PredictionResponse(
+            final_class=final_class,
+            final_confidence=confidence if final_class != "CouldNotPredict" else 0.0
         )
+
+        # Save prediction to JSON file
+        save_prediction_to_json({
+            "final_class": final_class,
+            "final_confidence": confidence if final_class != "CouldNotPredict" else 0.0
+        }, filename, "success")
+
+        return prediction
     except HTTPException as e:
         raise e
     except Exception as e:
