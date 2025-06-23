@@ -1,11 +1,14 @@
+
 from pydantic import BaseModel
 
 class PredictionResponse(BaseModel):
-    resnet_class: str
-    resnet_confidence: float
-    effnet_class: str
-    effnet_confidence: float
-    cnn_class: str
-    cnn_confidence: float
     final_class: str
     final_confidence: float
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "final_class": "YakiNaran",
+                "final_confidence": 0.905681848526001
+            }
+        }
