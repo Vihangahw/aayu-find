@@ -1,0 +1,19 @@
+# Python bytecode
+__pycache__/
+
+# Model checkpoint files
+classifier_model2_best.pth
+unet_best.pth
+ensembleUNET_model_best.pth
+best_efficientnet.pth
+
+# Dataset directory
+toTest/
+
+photos
+
+predictions
+
+test_results
+
+
