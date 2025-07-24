@@ -2,12 +2,9 @@
 __pycache__/
 
 # Model checkpoint files
-classifier_model2_best.pth
-unet_best.pth
-ensembleUNET_model_best.pth
-best_efficientnet.pth
+models
 
-# Dataset directory
+
 toTest/
 
 photos
@@ -15,3 +12,8 @@ photos
 predictions
 
 test_results
+
+*.db
+
+blog_images
+
